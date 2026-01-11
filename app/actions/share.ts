@@ -11,9 +11,12 @@ const log = DEBUG_ENABLED ? console.log : () => {}
 const logError = DEBUG_ENABLED ? console.error : () => {}
 const logWarn = DEBUG_ENABLED ? console.warn : () => {}
 
-// File-based storage as fallback (persists across server restarts)
+// File-based storage as fallback (persists across server restarts in local dev)
 const STORAGE_DIR = path.join(process.cwd(), ".secure-shares")
 const STORAGE_FILE = path.join(STORAGE_DIR, "shares.json")
+
+// Detect if running in production environment (no persistent file system)
+const IS_PRODUCTION = process.env.NODE_ENV === "production" || !!process.env.VERCEL
 
 // Initialize Redis using proper ES module import
 let redis: any = null
@@ -37,6 +40,8 @@ async function initRedis() {
     log("  REDIS_URL:", !!process.env.REDIS_URL)
     log("  Using URL:", !!redisUrl)
     log("  Using Token:", !!redisToken)
+    log("  NODE_ENV:", process.env.NODE_ENV)
+    log("  VERCEL:", !!process.env.VERCEL)
 
     if (redisUrl && redisToken) {
       log("🔄 Initializing Redis with available credentials...")
@@ -55,13 +60,16 @@ async function initRedis() {
       redisInitialized = true
       return redis
     } else {
-      log("⚠️ No Redis credentials found in environment variables")
-      log(
-        "  Available env vars:",
+      logWarn("⚠️ No Redis credentials found in environment variables")
+      logWarn(
+        "  Available env vars with REDIS/KV/UPSTASH:",
         Object.keys(process.env).filter(
           (key) => key.includes("REDIS") || key.includes("KV") || key.includes("UPSTASH"),
         ),
       )
+      if (IS_PRODUCTION) {
+        logWarn("⚠️ Running in production without Redis! Shares will not persist.")
+      }
     }
   } catch (error) {
     logWarn("❌ Redis initialization failed:", error)
@@ -102,6 +110,12 @@ async function ensureStorageDir() {
 // Load shares from file
 async function loadFileStorage(): Promise<FileStorage> {
   try {
+    // Skip file storage in production environments
+    if (IS_PRODUCTION) {
+      log("⏭️ Skipping file storage in production environment")
+      return {}
+    }
+
     await ensureStorageDir()
     if (existsSync(STORAGE_FILE)) {
       const content = await readFile(STORAGE_FILE, "utf-8")
@@ -128,7 +142,7 @@ async function loadFileStorage(): Promise<FileStorage> {
       log(`📁 Loaded ${Object.keys(cleaned).length} shares from file storage`)
       return cleaned
     } else {
-      log("� No existin g storage file found, starting fresh")
+      log("📁 No existing storage file found, starting fresh")
     }
   } catch (error) {
     logError("❌ Failed to load file storage:", error)
@@ -139,12 +153,21 @@ async function loadFileStorage(): Promise<FileStorage> {
 // Save shares to file
 async function saveFileStorage(storage: FileStorage): Promise<void> {
   try {
+    // Skip file storage in production environments
+    if (IS_PRODUCTION) {
+      log("⏭️ Skipping file storage save in production environment")
+      return
+    }
+
     await ensureStorageDir()
     await writeFile(STORAGE_FILE, JSON.stringify(storage, null, 2))
     log(`💾 Saved ${Object.keys(storage).length} shares to file storage`)
   } catch (error) {
     logError("❌ Failed to save file storage:", error)
-    throw error
+    // Don't throw in production - file system may not be writable
+    if (!IS_PRODUCTION) {
+      throw error
+    }
   }
 }
 
@@ -181,6 +204,7 @@ function getExpirationTime(timeString: string): Date {
 
 async function storeData(key: string, data: ShareData, ttlSeconds: number): Promise<boolean> {
   log(`📦 Storing data with key: ${key}, ID: ${data.id}, TTL: ${ttlSeconds}s`)
+  log(`   Environment: NODE_ENV=${process.env.NODE_ENV}, IS_PRODUCTION=${IS_PRODUCTION}`)
 
   const expiresAt = Date.now() + ttlSeconds * 1000
   let redisStored = false
@@ -199,22 +223,35 @@ async function storeData(key: string, data: ShareData, ttlSeconds: number): Prom
     } catch (error) {
       logError("❌ Redis storage failed:", error)
     }
+  } else {
+    logWarn("⚠️ Redis not available")
+    if (IS_PRODUCTION) {
+      logError("❌ CRITICAL: Redis is required in production but not available!")
+    }
   }
 
-  // Always store in file system as backup/primary
-  try {
-    const fileStorage = await loadFileStorage()
-    fileStorage[key] = { data, expiresAt }
-    await saveFileStorage(fileStorage)
-    log(`✅ File storage successful for key: ${key}`)
-    fileStored = true
-  } catch (error) {
-    logError("❌ File storage failed:", error)
+  // Only try file storage in development/non-production environments
+  if (!IS_PRODUCTION) {
+    try {
+      const fileStorage = await loadFileStorage()
+      fileStorage[key] = { data, expiresAt }
+      await saveFileStorage(fileStorage)
+      log(`✅ File storage successful for key: ${key}`)
+      fileStored = true
+    } catch (error) {
+      logError("❌ File storage failed:", error)
+    }
+  } else {
+    log("⏭️ Skipping file storage in production")
   }
 
   // Return true if at least one storage method succeeded
   const stored = redisStored || fileStored
   log(`📊 Storage summary - Redis: ${redisStored}, File: ${fileStored}, Overall: ${stored}`)
+
+  if (!stored && IS_PRODUCTION) {
+    logError("❌ CRITICAL: No storage method succeeded in production! Redis must be configured.")
+  }
 
   return stored
 }
@@ -430,6 +467,11 @@ export async function createSecureShare(data: {
 
     if (!stored) {
       logError("❌ Failed to store data in any storage system")
+      if (IS_PRODUCTION) {
+        logError("❌ PRODUCTION ERROR: Redis database is not properly configured or unavailable.")
+        logError("❌ Please check that UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN are set.")
+        return { success: false, error: "Database configuration error - Redis is required but unavailable" }
+      }
       return { success: false, error: "Failed to store secure share" }
     }
 
